@@ -87,6 +87,8 @@ A general overview of building from source:
 
 ## Other Documentation
 This directory contains further detailed documentation:
+- [OVERVIEW.md](./OVERVIEW.md): A high-level introduction to what Goose is and how it works.
+- [AGENT.md](./AGENT.md): In-depth explanation of the agent's internal workings.
 - [ARCHITECTURE.md](./ARCHITECTURE.md): High-level system architecture, patterns, and decisions.
 - [TECH_STACK.md](./TECH_STACK.md): Breakdown of the technologies, languages, and frameworks used.
 - [COMPONENTS.md](./COMPONENTS.md): Detailed information on major components and modules.
