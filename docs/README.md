@@ -96,6 +96,7 @@ This directory contains further detailed documentation:
 - [DEBUGGING_AND_TROUBLESHOOTING.md](./DEBUGGING_AND_TROUBLESHOOTING.md): Tips for debugging, logging, and common issues.
 - [API_REFERENCE.md](./API_REFERENCE.md): Documentation for any public APIs or FFI interfaces.
 - [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md): Information on database structure (if applicable).
+- [IDEAS.md](./IDEAS.md): Exploration of potential future extensions and adaptations for Goose.
 
 For the official, user-facing documentation, please visit [https://block.github.io/goose/](https://block.github.io/goose/).
 
