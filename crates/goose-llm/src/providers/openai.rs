@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,7 +16,9 @@ use crate::{
     model::ModelConfig,
     providers::{Provider, ProviderCompleteResponse, ProviderExtractResponse, Usage},
     types::core::Tool,
+    usage_tracker::TokenUsageTracker,
 };
+use goose::{model::GPT_4O_TOKENIZER, token_counter::TokenCounter};
 
 pub const OPEN_AI_DEFAULT_MODEL: &str = "gpt-4o";
 pub const _OPEN_AI_KNOWN_MODELS: &[&str] = &["gpt-4o", "gpt-4.1", "o1", "o3", "o4-mini"];
@@ -74,12 +76,17 @@ pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     model: ModelConfig,
     client: Client,
+    token_counter: Arc<TokenCounter>,
+    usage_tracker: TokenUsageTracker,
 }
 
 impl OpenAiProvider {
     pub fn from_env(model: ModelConfig) -> Self {
         let config = OpenAiProviderConfig::from_env();
-        OpenAiProvider::from_config(config, model).expect("Failed to initialize OpenAiProvider")
+        let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        OpenAiProvider::from_config(config, model, token_counter, usage_tracker)
+            .expect("Failed to initialize OpenAiProvider")
     }
 }
 
@@ -87,12 +94,20 @@ impl Default for OpenAiProvider {
     fn default() -> Self {
         let config = OpenAiProviderConfig::from_env();
         let model = ModelConfig::new(OPEN_AI_DEFAULT_MODEL.to_string());
-        OpenAiProvider::from_config(config, model).expect("Failed to initialize OpenAiProvider")
+        let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        OpenAiProvider::from_config(config, model, token_counter, usage_tracker)
+            .expect("Failed to initialize OpenAiProvider")
     }
 }
 
 impl OpenAiProvider {
-    pub fn from_config(config: OpenAiProviderConfig, model: ModelConfig) -> Result<Self> {
+    pub fn from_config(
+        config: OpenAiProviderConfig,
+        model: ModelConfig,
+        token_counter: Arc<TokenCounter>,
+        usage_tracker: TokenUsageTracker,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout))
             .build()?;
@@ -101,6 +116,8 @@ impl OpenAiProvider {
             config,
             model,
             client,
+            token_counter,
+            usage_tracker,
         })
     }
 
@@ -144,6 +161,10 @@ impl Provider for OpenAiProvider {
         skip(self, system, messages, tools),
         fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
     )]
+    fn usage_tracker(&self) -> TokenUsageTracker {
+        self.usage_tracker.clone()
+    }
+
     async fn complete(
         &self,
         system: &str,
@@ -151,6 +172,10 @@ impl Provider for OpenAiProvider {
         tools: &[Tool],
     ) -> Result<ProviderCompleteResponse, ProviderError> {
         let payload = create_request(&self.model, system, messages, tools, &ImageFormat::OpenAi)?;
+
+        let calculated_input_tokens = self
+            .token_counter
+            .count_chat_tokens(system, messages, tools) as u64;
 
         // Make request
         let response = self.post(payload.clone()).await?;
@@ -166,6 +191,30 @@ impl Provider for OpenAiProvider {
             Err(e) => return Err(e),
         };
         let model = get_model(&response);
+
+        let final_input_tokens = if usage.input_tokens.unwrap_or_default() > 0 {
+            usage.input_tokens.unwrap_or_default() as u64
+        } else {
+            calculated_input_tokens
+        };
+
+        let final_output_tokens = if usage.output_tokens.unwrap_or_default() > 0 {
+            usage.output_tokens.unwrap_or_default() as u64
+        } else {
+            let response_text = message
+                .content
+                .iter()
+                .find_map(|c| c.as_text())
+                .unwrap_or_default();
+            self.token_counter.count_tokens(response_text) as u64
+        };
+
+        self.usage_tracker.record_usage(
+            &self.model.model_id,
+            final_input_tokens,
+            final_output_tokens,
+        );
+
         emit_debug_trace(&self.model, &payload, &response, &usage);
         Ok(ProviderCompleteResponse::new(message, model, usage))
     }
@@ -194,6 +243,11 @@ impl Provider for OpenAiProvider {
                     }
                 }),
             );
+
+        // For extract, tools are empty
+        let calculated_input_tokens = self
+            .token_counter
+            .count_chat_tokens(system, messages, &[]) as u64;
 
         // 3. Call OpenAI
         let response = self.post(payload.clone()).await?;
@@ -225,6 +279,27 @@ impl Provider for OpenAiProvider {
             Err(e) => return Err(e),
         };
         let model = get_model(&response);
+
+        let final_input_tokens = if usage.input_tokens.unwrap_or_default() > 0 {
+            usage.input_tokens.unwrap_or_default() as u64
+        } else {
+            calculated_input_tokens
+        };
+
+        let final_output_tokens = if usage.output_tokens.unwrap_or_default() > 0 {
+            usage.output_tokens.unwrap_or_default() as u64
+        } else {
+            match serde_json::to_string(&data) {
+                Ok(data_str) => self.token_counter.count_tokens(&data_str) as u64,
+                Err(_) => 0, // Or handle error appropriately
+            }
+        };
+
+        self.usage_tracker.record_usage(
+            &self.model.model_id,
+            final_input_tokens,
+            final_output_tokens,
+        );
 
         Ok(ProviderExtractResponse::new(data, model, usage))
     }

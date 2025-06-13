@@ -2,10 +2,18 @@
 
 use anyhow::Result;
 use dotenv::dotenv;
-use goose_llm::message::Message;
+use goose::message::{Message, MessageContent, Role};
+use goose::model::{CLAUDE_TOKENIZER, GPT_4O_TOKENIZER}; // Added CLAUDE_TOKENIZER
+use goose::token_counter::TokenCounter;
+use goose_llm::model::ModelConfig;
 use goose_llm::providers::base::Provider;
-use goose_llm::providers::{databricks::DatabricksProvider, openai::OpenAiProvider};
-use goose_llm::ModelConfig;
+use goose_llm::providers::databricks::{
+    DatabricksProvider, DatabricksProviderConfig, DATABRICKS_DEFAULT_MODEL,
+}; // Full import for new tests
+use goose_llm::providers::openai::{OpenAiProvider, OpenAiProviderConfig, OPEN_AI_DEFAULT_MODEL};
+use goose_llm::providers::utils::ImageFormat as ProviderImageFormat; // Added for Databricks config
+use goose_llm::usage_tracker::TokenUsageTracker;
+use httpmock::prelude::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -191,5 +199,302 @@ mod tests {
     #[tokio::test]
     async fn databricks_extract_ui() -> Result<()> {
         run_extract_ui_test(ProviderType::Databricks, "goose-gpt-4-1").await
+    }
+
+    #[tokio::test]
+    async fn test_openai_extract_records_api_token_usage() {
+        let server = MockServer::start();
+        let model_id = OPEN_AI_DEFAULT_MODEL.to_string();
+        let prompt_tokens_from_api = 60u64;
+        let completion_tokens_from_api = 120u64;
+
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions"); // extract uses the same endpoint
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "chatcmpl-ext-123",
+                    "object": "chat.completion",
+                    "created": 1677652288,
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            // For extract, content is often a stringified JSON
+                            "content": "{\"name\": \"Test Name\", \"value\": 123}",
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens_from_api,
+                        "completion_tokens": completion_tokens_from_api,
+                        "total_tokens": prompt_tokens_from_api + completion_tokens_from_api
+                    }
+                }));
+        });
+
+        let config = OpenAiProviderConfig {
+            api_key: "test_key".to_string(),
+            host: server.base_url(),
+            organization: None,
+            base_path: "v1/chat/completions".to_string(),
+            project: None,
+            custom_headers: None,
+            timeout: 5,
+        };
+
+        let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        let model_config = ModelConfig::new(model_id.clone()); // Already correctly using ModelConfig
+        let provider = OpenAiProvider::from_config(
+            config,
+            model_config,
+            Arc::clone(&token_counter),
+            usage_tracker.clone(),
+        )
+        .unwrap();
+
+        let system_prompt = "Extract information.";
+        let messages = vec![Message {
+            role: Role::User,
+            created: 0,
+            content: vec![MessageContent::text("User data to extract from.")],
+        }];
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}, "value": {"type": "number"}}});
+
+        let _ = provider
+            .extract(system_prompt, &messages, &schema)
+            .await
+            .unwrap();
+
+        let usage = usage_tracker.get_usage(&model_id).unwrap();
+        assert_eq!(usage.input_tokens, prompt_tokens_from_api);
+        assert_eq!(usage.output_tokens, completion_tokens_from_api);
+    }
+
+    #[tokio::test]
+    async fn test_openai_extract_records_calculated_token_usage() {
+        let server = MockServer::start();
+        let model_id = OPEN_AI_DEFAULT_MODEL.to_string();
+
+        // This is the actual JSON object the model would "return" as a string
+        let extracted_data_obj = json!({"name": "Calculated Test", "value": 456});
+        // The model returns it as a string in the "content" field
+        let content_string = extracted_data_obj.to_string();
+        // Expected output tokens for `{"name": "Calculated Test", "value": 456}` with GPT-4o.
+        // Manually checked with a tokenizer: `{"name":"Calculated Test","value":456}` is 13 tokens.
+        let expected_output_tokens = 13u64;
+
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "chatcmpl-ext-456",
+                    "object": "chat.completion",
+                    "created": 1677652288,
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content_string, // Model returns stringified JSON
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { // API provides zero tokens
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                }));
+        });
+
+        let config = OpenAiProviderConfig {
+            api_key: "test_key".to_string(),
+            host: server.base_url(),
+            organization: None,
+            base_path: "v1/chat/completions".to_string(),
+            project: None,
+            custom_headers: None,
+            timeout: 5,
+        };
+
+        let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        let model_config = ModelConfig::new(model_id.clone()); // Already correctly using ModelConfig
+        let provider = OpenAiProvider::from_config(
+            config,
+            model_config,
+            Arc::clone(&token_counter),
+            usage_tracker.clone(),
+        )
+        .unwrap();
+
+        let system_prompt = "Extract data."; // 3 tokens GPT-4o
+        let messages = vec![Message {
+            role: Role::User,
+            created: 0,
+            content: vec![MessageContent::text("Some user input.")], // 4 tokens
+        }];
+        // Expected input: count_chat_tokens("Extract data.", messages, []) (tools are empty for extract)
+        // System: "Extract data." (3) + 4 (tokens_per_message) = 7
+        // User: "Some user input." (4) + 4 (tokens_per_message) = 8
+        // Reply prime: 3
+        // Total expected input = 7 + 8 + 3 = 18 tokens.
+        let expected_input_tokens = 18u64;
+
+        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}, "value": {"type": "number"}}});
+
+        let _ = provider
+            .extract(system_prompt, &messages, &schema)
+            .await
+            .unwrap();
+
+        let usage = usage_tracker.get_usage(&model_id).unwrap();
+        assert_eq!(usage.input_tokens, expected_input_tokens);
+        assert_eq!(usage.output_tokens, expected_output_tokens);
+    }
+
+    #[tokio::test]
+    async fn test_databricks_extract_records_api_token_usage() {
+        let server = MockServer::start();
+        let model_name = DATABRICKS_DEFAULT_MODEL.to_string();
+        let prompt_tokens_from_api = 75u64;
+        let completion_tokens_from_api = 150u64;
+
+        server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/serving-endpoints/{}/invocations", model_name));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"extracted_field\": \"Databricks API value\"}",
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens_from_api,
+                        "completion_tokens": completion_tokens_from_api,
+                        "total_tokens": prompt_tokens_from_api + completion_tokens_from_api
+                    }
+                }));
+        });
+
+        let config = DatabricksProviderConfig {
+            host: server.base_url(),
+            token: "db_test_token".to_string(),
+            image_format: ProviderImageFormat::OpenAi, // Or appropriate
+            timeout: 5,
+        };
+
+        let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        let model_config =
+            ModelConfig::new_with_name(model_name.clone(), model_name.clone());
+        let provider = DatabricksProvider::from_config(
+            config,
+            model_config.clone(),
+            Arc::clone(&token_counter),
+            usage_tracker.clone(),
+        )
+        .unwrap();
+
+        let system_prompt = "Extract from Databricks.";
+        let messages = vec![Message {
+            role: Role::User,
+            created: 0,
+            content: vec![MessageContent::text(
+                "Some text for Databricks extraction.",
+            )],
+        }];
+        let schema =
+            json!({"type": "object", "properties": {"extracted_field": {"type": "string"}}});
+
+        let _ = provider
+            .extract(system_prompt, &messages, &schema)
+            .await
+            .unwrap();
+
+        let usage = usage_tracker.get_usage(&model_config.model_name).unwrap();
+        assert_eq!(usage.input_tokens, prompt_tokens_from_api);
+        assert_eq!(usage.output_tokens, completion_tokens_from_api);
+    }
+
+    #[tokio::test]
+    async fn test_databricks_extract_records_calculated_token_usage() {
+        let server = MockServer::start();
+        let model_name = DATABRICKS_DEFAULT_MODEL.to_string();
+
+        let extracted_data_obj = json!({"field": "Calculated Databricks Data"});
+        let content_string = extracted_data_obj.to_string();
+
+        server.mock(|when, then| {
+            when.method(POST)
+                .path(format!("/serving-endpoints/{}/invocations", model_name));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content_string,
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                }));
+        });
+
+        let config = DatabricksProviderConfig {
+            host: server.base_url(),
+            token: "db_test_token".to_string(),
+            image_format: ProviderImageFormat::OpenAi,
+            timeout: 5,
+        };
+
+        let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        let model_config =
+            ModelConfig::new_with_name(model_name.clone(), model_name.clone());
+        let provider = DatabricksProvider::from_config(
+            config,
+            model_config.clone(),
+            Arc::clone(&token_counter),
+            usage_tracker.clone(),
+        )
+        .unwrap();
+
+        let system_prompt = "System for Databricks extract."; // 5 tokens with Claude
+        let messages = vec![Message {
+            role: Role::User,
+            created: 0,
+            content: vec![MessageContent::text("User input to extract.")], // 5 tokens
+        }];
+        // Expected input with CLAUDE_TOKENIZER:
+        // System: "System for Databricks extract." (5) + 4 = 9
+        // User: "User input to extract." (5) + 4 = 9
+        // Reply prime: 3
+        // Total expected input = 9 + 9 + 3 = 21 tokens.
+        let expected_input_tokens = 21u64;
+        let expected_output_tokens = token_counter.count_tokens(&content_string) as u64;
+
+        let schema = json!({"type": "object", "properties": {"field": {"type": "string"}}});
+        let _ = provider
+            .extract(system_prompt, &messages, &schema)
+            .await
+            .unwrap();
+
+        let usage = usage_tracker.get_usage(&model_config.model_name).unwrap();
+        assert_eq!(usage.input_tokens, expected_input_tokens);
+        assert_eq!(usage.output_tokens, expected_output_tokens);
     }
 }

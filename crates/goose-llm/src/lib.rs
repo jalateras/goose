@@ -8,6 +8,7 @@ mod prompt_template;
 pub mod providers;
 mod structured_outputs;
 pub mod types;
+pub mod usage_tracker;
 
 pub use completion::completion;
 pub use message::Message;

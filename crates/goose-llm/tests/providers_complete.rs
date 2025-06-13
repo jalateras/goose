@@ -1,13 +1,25 @@
 use anyhow::Result;
 use dotenv::dotenv;
-use goose_llm::message::{Message, MessageContent};
+use goose::message::{Message, MessageContent, Role};
+use goose::model::{CLAUDE_TOKENIZER, GPT_4O_TOKENIZER}; // Added CLAUDE_TOKENIZER
+use goose::token_counter::TokenCounter;
+use goose_llm::model::ModelConfig;
 use goose_llm::providers::base::Provider;
+use goose_llm::providers::databricks::{
+    DatabricksProvider, DatabricksProviderConfig, DATABRICKS_DEFAULT_MODEL,
+}; // Added for new tests
 use goose_llm::providers::errors::ProviderError;
-use goose_llm::providers::{databricks, openai};
+use goose_llm::providers::openai::{OpenAiProvider, OpenAiProviderConfig, OPEN_AI_DEFAULT_MODEL};
+use goose_llm::providers::utils::ImageFormat; // Added for Databricks config
 use goose_llm::types::core::{Content, Tool};
+use goose_llm::usage_tracker::TokenUsageTracker;
+use httpmock::prelude::*;
+use serde_json::json; // Added
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::Arc; // Already here
 use std::sync::Mutex;
+// Note: openai module itself is not directly used from goose_llm::providers::openai in existing tests,
+// but the specific structs are now imported for the new tests.
 
 #[derive(Debug, Clone, Copy)]
 enum TestStatus {
@@ -377,4 +389,290 @@ async fn databricks_complete() -> Result<()> {
 #[ctor::dtor]
 fn print_test_report() {
     TEST_REPORT.print_summary();
+}
+
+#[tokio::test]
+async fn test_openai_complete_records_api_token_usage() {
+    let server = MockServer::start();
+
+    let model_id = OPEN_AI_DEFAULT_MODEL.to_string();
+    let prompt_tokens_from_api = 50;
+    let completion_tokens_from_api = 100;
+
+    server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello there!",
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens_from_api,
+                    "completion_tokens": completion_tokens_from_api,
+                    "total_tokens": prompt_tokens_from_api + completion_tokens_from_api
+                }
+            }));
+    });
+
+    let config = OpenAiProviderConfig {
+        api_key: "test_key".to_string(),
+        host: server.base_url(),
+        organization: None,
+        base_path: "v1/chat/completions".to_string(), // Ensure this matches mock path
+        project: None,
+        custom_headers: None,
+        timeout: 5,
+    };
+
+    let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+    let usage_tracker = TokenUsageTracker::new();
+    let model_config = ModelConfig::new(model_id.clone());
+    let provider = OpenAiProvider::from_config(
+        config,
+        model_config,
+        Arc::clone(&token_counter),
+        usage_tracker.clone(),
+    )
+    .unwrap();
+
+    let system_prompt = "You are a helpful assistant.";
+    let messages = vec![Message {
+        role: Role::User, // Ensure Role::User is correct
+        created: 0,
+        content: vec![MessageContent::text("Hello")],
+    }];
+
+    let _ = provider
+        .complete(system_prompt, &messages, &[])
+        .await
+        .unwrap();
+
+    let usage = usage_tracker.get_usage(&model_id).unwrap();
+    assert_eq!(usage.input_tokens, prompt_tokens_from_api as u64); // Cast to u64
+    assert_eq!(usage.output_tokens, completion_tokens_from_api as u64); // Cast to u64
+}
+
+#[tokio::test]
+async fn test_openai_complete_records_calculated_token_usage() {
+    let server = MockServer::start();
+    let model_id = OPEN_AI_DEFAULT_MODEL.to_string();
+
+    server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "This is a test response.", // 5 tokens with GPT-4o tokenizer
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": { // API provides zero tokens
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }));
+    });
+
+    let config = OpenAiProviderConfig {
+        api_key: "test_key".to_string(),
+        host: server.base_url(),
+        organization: None,
+        base_path: "v1/chat/completions".to_string(),
+        project: None,
+        custom_headers: None,
+        timeout: 5,
+    };
+
+    let token_counter = Arc::new(TokenCounter::new(GPT_4O_TOKENIZER));
+    let usage_tracker = TokenUsageTracker::new();
+    let model_config = ModelConfig::new(model_id.clone());
+    let provider = OpenAiProvider::from_config(
+        config,
+        model_config,
+        Arc::clone(&token_counter),
+        usage_tracker.clone(),
+    )
+    .unwrap();
+
+    let system_prompt = "System prompt."; // 3 tokens with GPT-4o
+    let messages = vec![Message {
+        role: Role::User,
+        created: 0,
+        content: vec![MessageContent::text("User message.")], // 3 tokens
+    }];
+    // Expected input: count_chat_tokens("System prompt.", messages, [])
+    // System: "System prompt." (3) + 4 (tokens_per_message) = 7
+    // User: "User message." (3) + 4 (tokens_per_message) = 7
+    // Reply prime: 3
+    // Total expected input = 7 + 7 + 3 = 17 tokens.
+    let expected_input_tokens = 17;
+    let expected_output_tokens = 5; // "This is a test response."
+
+    let _ = provider
+        .complete(system_prompt, &messages, &[])
+        .await
+        .unwrap();
+
+    let usage = usage_tracker.get_usage(&model_id).unwrap();
+    assert_eq!(usage.input_tokens, expected_input_tokens);
+    assert_eq!(usage.output_tokens, expected_output_tokens);
+}
+
+#[tokio::test]
+async fn test_databricks_complete_records_api_token_usage() {
+    let server = MockServer::start();
+    let model_name = DATABRICKS_DEFAULT_MODEL.to_string(); // Used in URL path for Databricks
+    let prompt_tokens_from_api = 70u64;
+    let completion_tokens_from_api = 140u64;
+
+    server.mock(|when, then| {
+        when.method(POST)
+            .path(format!("/serving-endpoints/{}/invocations", model_name));
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Databricks response here.",
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens_from_api,
+                    "completion_tokens": completion_tokens_from_api,
+                    "total_tokens": prompt_tokens_from_api + completion_tokens_from_api
+                }
+            }));
+    });
+
+    let config = DatabricksProviderConfig {
+        host: server.base_url(),
+        token: "db_test_token".to_string(),
+        image_format: ImageFormat::OpenAi, // Default or configure as needed
+        timeout: 5,
+    };
+
+    let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+    let usage_tracker = TokenUsageTracker::new();
+    // model_name for Databricks is the endpoint name / model identifier
+    let model_config = ModelConfig::new_with_name(
+        DATABRICKS_DEFAULT_MODEL.to_string(),
+        DATABRICKS_DEFAULT_MODEL.to_string(),
+    );
+    let provider = DatabricksProvider::from_config(
+        config,
+        model_config.clone(),
+        Arc::clone(&token_counter),
+        usage_tracker.clone(),
+    )
+    .unwrap();
+
+    let system_prompt = "You are a Databricks assistant.";
+    let messages = vec![Message {
+        role: Role::User,
+        created: 0,
+        content: vec![MessageContent::text("Query for Databricks.")],
+    }];
+
+    let _ = provider
+        .complete(system_prompt, &messages, &[])
+        .await
+        .unwrap();
+
+    // Usage is tracked by model_name in DatabricksProvider
+    let usage = usage_tracker.get_usage(&model_config.model_name).unwrap();
+    assert_eq!(usage.input_tokens, prompt_tokens_from_api);
+    assert_eq!(usage.output_tokens, completion_tokens_from_api);
+}
+
+#[tokio::test]
+async fn test_databricks_complete_records_calculated_token_usage() {
+    let server = MockServer::start();
+    let model_name = DATABRICKS_DEFAULT_MODEL.to_string();
+    let response_text = "Calculated Databricks response."; // Approx 4 tokens with Claude (Sonnet)
+
+    server.mock(|when, then| {
+        when.method(POST)
+            .path(format!("/serving-endpoints/{}/invocations", model_name));
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    }
+                }],
+                "usage": { // API provides zero tokens
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                }
+            }));
+    });
+
+    let config = DatabricksProviderConfig {
+        host: server.base_url(),
+        token: "db_test_token".to_string(),
+        image_format: ImageFormat::OpenAi,
+        timeout: 5,
+    };
+
+    let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+    let usage_tracker = TokenUsageTracker::new();
+    let model_config = ModelConfig::new_with_name(
+        DATABRICKS_DEFAULT_MODEL.to_string(),
+        DATABRICKS_DEFAULT_MODEL.to_string(),
+    );
+    let provider = DatabricksProvider::from_config(
+        config,
+        model_config.clone(),
+        Arc::clone(&token_counter),
+        usage_tracker.clone(),
+    )
+    .unwrap();
+
+    let system_prompt = "System for Databricks."; // 4 tokens with Claude
+    let messages = vec![Message {
+        role: Role::User,
+        created: 0,
+        content: vec![MessageContent::text("User query.")], // 3 tokens
+    }];
+    // Expected input with CLAUDE_TOKENIZER:
+    // System: "System for Databricks." (4) + 4 (tokens_per_message) = 8
+    // User: "User query." (3) + 4 (tokens_per_message) = 7
+    // Reply prime: 3
+    // Total expected input = 8 + 7 + 3 = 18 tokens.
+    let expected_input_tokens = 18u64;
+    let expected_output_tokens = token_counter.count_tokens(response_text) as u64;
+
+    let _ = provider
+        .complete(system_prompt, &messages, &[])
+        .await
+        .unwrap();
+
+    let usage = usage_tracker.get_usage(&model_config.model_name).unwrap();
+    assert_eq!(usage.input_tokens, expected_input_tokens);
+    assert_eq!(usage.output_tokens, expected_output_tokens);
 }

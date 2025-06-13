@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::errors::ProviderError;
-use crate::{message::Message, types::core::Tool};
+use crate::{message::Message, types::core::Tool, usage_tracker::TokenUsageTracker};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, uniffi::Record)]
 pub struct Usage {
@@ -63,6 +63,8 @@ impl ProviderExtractResponse {
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
 #[async_trait]
 pub trait Provider: Send + Sync {
+    fn usage_tracker(&self) -> TokenUsageTracker;
+
     /// Generate the next message using the configured model and other parameters
     ///
     /// # Arguments

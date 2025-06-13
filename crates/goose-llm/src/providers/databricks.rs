@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,7 +17,9 @@ use crate::{
     model::ModelConfig,
     providers::{Provider, ProviderCompleteResponse, ProviderExtractResponse, Usage},
     types::core::Tool,
+    usage_tracker::TokenUsageTracker,
 };
+use goose::{model::CLAUDE_TOKENIZER, token_counter::TokenCounter};
 
 pub const DATABRICKS_DEFAULT_MODEL: &str = "databricks-claude-3-7-sonnet";
 // Databricks can passthrough to a wide range of models, we only provide the default
@@ -62,12 +64,16 @@ pub struct DatabricksProvider {
     config: DatabricksProviderConfig,
     model: ModelConfig,
     client: Client,
+    token_counter: Arc<TokenCounter>,
+    usage_tracker: TokenUsageTracker,
 }
 
 impl DatabricksProvider {
     pub fn from_env(model: ModelConfig) -> Self {
         let config = DatabricksProviderConfig::from_env();
-        DatabricksProvider::from_config(config, model)
+        let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        DatabricksProvider::from_config(config, model, token_counter, usage_tracker)
             .expect("Failed to initialize DatabricksProvider")
     }
 }
@@ -76,13 +82,20 @@ impl Default for DatabricksProvider {
     fn default() -> Self {
         let config = DatabricksProviderConfig::from_env();
         let model = ModelConfig::new(DATABRICKS_DEFAULT_MODEL.to_string());
-        DatabricksProvider::from_config(config, model)
+        let token_counter = Arc::new(TokenCounter::new(CLAUDE_TOKENIZER));
+        let usage_tracker = TokenUsageTracker::new();
+        DatabricksProvider::from_config(config, model, token_counter, usage_tracker)
             .expect("Failed to initialize DatabricksProvider")
     }
 }
 
 impl DatabricksProvider {
-    pub fn from_config(config: DatabricksProviderConfig, model: ModelConfig) -> Result<Self> {
+    pub fn from_config(
+        config: DatabricksProviderConfig,
+        model: ModelConfig,
+        token_counter: Arc<TokenCounter>,
+        usage_tracker: TokenUsageTracker,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout))
             .build()?;
@@ -91,6 +104,8 @@ impl DatabricksProvider {
             config,
             model,
             client,
+            token_counter,
+            usage_tracker,
         })
     }
 
@@ -205,6 +220,10 @@ impl Provider for DatabricksProvider {
         skip(self, system, messages, tools),
         fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
     )]
+    fn usage_tracker(&self) -> TokenUsageTracker {
+        self.usage_tracker.clone()
+    }
+
     async fn complete(
         &self,
         system: &str,
@@ -224,6 +243,10 @@ impl Provider for DatabricksProvider {
             .expect("payload should have model key")
             .remove("model");
 
+        let calculated_input_tokens = self
+            .token_counter
+            .count_chat_tokens(system, messages, tools) as u64;
+
         let response = self.post(payload.clone()).await?;
 
         // Parse response
@@ -238,6 +261,29 @@ impl Provider for DatabricksProvider {
         };
         let model = get_model(&response);
         super::utils::emit_debug_trace(&self.model, &payload, &response, &usage);
+
+        let final_input_tokens = if usage.input_tokens.unwrap_or_default() > 0 {
+            usage.input_tokens.unwrap_or_default() as u64
+        } else {
+            calculated_input_tokens
+        };
+
+        let final_output_tokens = if usage.output_tokens.unwrap_or_default() > 0 {
+            usage.output_tokens.unwrap_or_default() as u64
+        } else {
+            let response_text = message
+                .content
+                .iter()
+                .find_map(|c| c.as_text())
+                .unwrap_or_default();
+            self.token_counter.count_tokens(response_text) as u64
+        };
+
+        self.usage_tracker.record_usage(
+            &self.model.model_name,
+            final_input_tokens,
+            final_output_tokens,
+        );
 
         Ok(ProviderCompleteResponse::new(message, model, usage))
     }
@@ -266,6 +312,11 @@ impl Provider for DatabricksProvider {
                     }
                 }),
             );
+
+        // For extract, tools are empty
+        let calculated_input_tokens = self
+            .token_counter
+            .count_chat_tokens(system, messages, &[]) as u64;
 
         // 3. Call OpenAI
         let response = self.post(payload.clone()).await?;
@@ -297,6 +348,27 @@ impl Provider for DatabricksProvider {
             Err(e) => return Err(e),
         };
         let model = get_model(&response);
+
+        let final_input_tokens = if usage.input_tokens.unwrap_or_default() > 0 {
+            usage.input_tokens.unwrap_or_default() as u64
+        } else {
+            calculated_input_tokens
+        };
+
+        let final_output_tokens = if usage.output_tokens.unwrap_or_default() > 0 {
+            usage.output_tokens.unwrap_or_default() as u64
+        } else {
+            match serde_json::to_string(&data) {
+                Ok(data_str) => self.token_counter.count_tokens(&data_str) as u64,
+                Err(_) => 0,
+            }
+        };
+
+        self.usage_tracker.record_usage(
+            &self.model.model_name,
+            final_input_tokens,
+            final_output_tokens,
+        );
 
         Ok(ProviderExtractResponse::new(data, model, usage))
     }
